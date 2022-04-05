@@ -9,6 +9,10 @@
 #include <algorithm>
 #include <string>
 
+// 用于解决 bad_alloc 问题，通过在过程中先写一部分到硬盘上，减少内存压力的方式
+// 该值定义了在 result 积累到多少时尝试进行一批 SSTable 的写
+#define KV_NUM_TO_WRITE_IN_COMPACTION 500
+
 // 自定义 compaction 中要使用的堆的比较函数
 // heap 会首先按照 first.first 来进行排序，之后按照 first.second 排序
 // 其中 first.first 越小越先输出（key小的在前输出）
@@ -66,7 +70,8 @@ private:
     uint64_t maxLevel = 0;
     void checkCompaction();  // 每次新增 SSTable 都调用检查一次
     void compaction(uint64_t level, unsigned int moreNum);
-    void writeListToSSTables(std::list<std::pair<uint64_t, std::string> > &allList, const uint64_t &timeStamp, const uint64_t &level);
+    void writeAllListToSSTables(std::list<std::pair<uint64_t, std::string> > &allList, const uint64_t &timeStamp, const uint64_t &level);
+    void tryWriteSomeListToSSTables(std::list<std::pair<uint64_t, std::string> > &allList, const uint64_t &timeStamp, const uint64_t &level, std::vector<SSTables *> &nextLevelTempCache);
 
     // 确定文件名并赋值到此处，不包含.sst
     // 文件命名格式 timeStamp minKey-maxKey pairsNum

@@ -166,13 +166,19 @@ void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, s
     //  （！！且因为索引区间有交叉，需要按照时间戳顺序，时间戳大在前），之后再是剩余的 level 由小到大
     //  这样下标越小优先级越高
 
-    // 下标为 0 位置（优先级最高）应当放置 listMem
-    listsAllLevels.push_back(listMem);
+    // 用于记录从 level1 开始，每一个 level 读到了哪个文件，应当读到哪个文件的下标，
+    // 这样等上一个文件读入排序完再进行下一个，防止内存中文件过多（可能相同的 key 很多导致内存炸掉）
+    // 其中 first 表示当前读到的 index （初始为 startIndex），second 表示
+    std::vector<std::pair<uint64_t, uint64_t> > nextAndEndFileIndexInLevels;
+    nextAndEndFileIndexInLevels.emplace_back(0,0);  // level 0 填充位置
+
     // 进堆
     if(!listMem.empty()){
         heap.emplace(listMem.front(), 0);
         listMem.pop_front();
     }
+    // 下标为 0 位置（优先级最高）应当放置 listMem
+    listsAllLevels.push_back(std::move(listMem));
 
     // 之后放置原本第零层的文件对应 list （！！且因为索引区间有交叉，需要按照时间戳顺序，时间戳大在前）
     unsigned int fileNumLevel0 = 0;  // 记录第零层有交集的文件数
@@ -184,17 +190,17 @@ void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, s
             std::list<std::pair<uint64_t, std::string> > listLevel;
             cache[0][lvl0_size-j-1]->readIndexAndDataForScan(listLevel, key1, key2);
 
-            // 将相应 list 放入索引
-            listsAllLevels.push_back(listLevel);
-
-            // 增加 level0 文件数
-            ++fileNumLevel0;
-
             // 进堆
             if(!listLevel.empty()){
                 heap.emplace(listLevel.front(), fileNumLevel0);
                 listLevel.pop_front();
             }
+
+            // 将相应 list 放入索引
+            listsAllLevels.push_back(std::move(listLevel));
+
+            // 增加 level0 文件数
+            ++fileNumLevel0;
         }
     }
 
@@ -242,10 +248,7 @@ void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, s
         }
 
         if(findTableInLevel){
-            for(auto j = startIndex; j <= endIndex; ++j){
-                // (cache[level][j])->readAllIndexAndData(listLevel);;
-                (cache[level][j])->readIndexAndDataForScan(listLevel, key1, key2);;
-            }
+            (cache[level][startIndex])->readIndexAndDataForScan(listLevel, key1, key2);
             if(!listLevel.empty()){
                 heap.emplace(listLevel.front(), level + fileNumLevel0);
                 listLevel.pop_front();
@@ -253,31 +256,43 @@ void KVStore::scan(uint64_t key1, uint64_t key2, std::list<std::pair<uint64_t, s
         }
 
         // 无论有没有内容，将相应 list 放入索引
-        listsAllLevels.push_back(listLevel);
+        listsAllLevels.push_back(std::move(listLevel));
+        nextAndEndFileIndexInLevels.emplace_back(startIndex + 1, endIndex);
     }
 
     // 对所有 lists 做最堆排序
+    uint64_t lastKey = -1;  // TODO: FIRST Key can not be max uint64_t
     while(!heap.empty()){
         auto top = heap.top();
         heap.pop();
-        list.push_back(top.first);
+        if(lastKey != top.first.first){
+            list.push_back(top.first);
+            lastKey = top.first.first;
+        }
         auto lvlIndex = top.second;
         if(!listsAllLevels[lvlIndex].empty()){
             heap.emplace(listsAllLevels[lvlIndex].front(), lvlIndex);
             listsAllLevels[lvlIndex].pop_front();
+        } else {
+            if(lvlIndex <= fileNumLevel0) continue;
+            auto nextAndEndFileIndex = nextAndEndFileIndexInLevels[lvlIndex - fileNumLevel0];
+            if(nextAndEndFileIndex.first <= nextAndEndFileIndex.second){
+                // 读入下一个 table
+                std::list<std::pair<uint64_t, std::string> > listLevel;
+                (cache[lvlIndex - fileNumLevel0][nextAndEndFileIndex.first])->readIndexAndDataForScan(listLevel, key1, key2);
+                heap.emplace(listLevel.front(), lvlIndex);
+                listLevel.pop_front();
+                listsAllLevels[lvlIndex] = std::move(listLevel);
+                nextAndEndFileIndexInLevels[lvlIndex - fileNumLevel0].first = nextAndEndFileIndex.first + 1;
+            }
         }
     }
-
-    auto a = list.size();
 
     // 注意 scan 如果发现多个相同的 key 以层数最小的为准！
     // 遍历 list 去除重复 key，遇到重复的 key 只保留第一个
     // 注意判定相等时候只比较 key，需要自定义比较函数
-    auto _it = unique(list.begin(), list.end(), cmpList);
-    list.erase(_it, list.end());
-
-
-    a = list.size();
+    // auto _it = unique(list.begin(), list.end(), cmpList);
+    // list.erase(_it, list.end());
 
     // 此时list为最终结果
 }
@@ -482,7 +497,7 @@ void KVStore::compaction(uint64_t level,  unsigned int moreNum)
         // 将结果每 2 MB 分成一个新的 SSTable 文件（最后一个 SSTable 可以不足 2MB），写入到 Level 1 中
         // 在其中操作时 cache 直接 push_back 即可
         // 取最大 maxTimeStamp 作为共同 timeStamp
-        writeListToSSTables(result, maxTimeStamp, level + 1);
+        writeAllListToSSTables(result, maxTimeStamp, level + 1);
 
         // 将临时缓存与目前的缓存合并
         if(findTableInNextLevel)
@@ -600,27 +615,50 @@ void KVStore::compaction(uint64_t level,  unsigned int moreNum)
         }
 
         cache[level].clear();
-        cache[level] = newLevelCache;
+        cache[level] = std::move(newLevelCache);
 
+        // next level 中区间相交的文件可能有很多很多，不能同时放在一个 list 中
         std::list<std::pair<std::pair<uint64_t, std::string>, uint64_t> > nextLevel_list;
+        uint64_t nextIndex = startIndex + 1;
         if(findTableInNextLevel){
             for(auto j = startIndex; j <= endIndex; ++j){
                 // 直接把 timeStamp 信息一起弄进去
-                (cache[level + 1][j])->readAllIndexAndDataWithTimeStamp(nextLevel_list);
                 maxTimeStamp = getMax(maxTimeStamp, (cache[level + 1][j])->getTimeStamp());
             }
+            (cache[level + 1][startIndex])->readAllIndexAndDataWithTimeStamp(nextLevel_list);
         }
 
         std::list<std::pair<uint64_t, std::string> > result;
+        // 为了缓解内存占用过大的问题，在 result 具备一定规模时尝试写一部分，nextLevelTempCache 暂存这一部分的 cache
+        std::vector<SSTables *> nextLevelTempCache;
+        // 记录 result 中放了多少 key-val 对，达到一定程度就先写入 SSTable
+        uint64_t cnt = 0;
         // 本层挑选出的文件 level_list 与下一层挑选出的文件 nextLevel_list 进行两路归并
-        while(!level_list.empty() && !nextLevel_list.empty()){
+        while(!level_list.empty()){
+            if(cnt > KV_NUM_TO_WRITE_IN_COMPACTION){
+                tryWriteSomeListToSSTables(result, maxTimeStamp, level+1, nextLevelTempCache);
+                cnt = 0;
+            }
+            if(findTableInNextLevel){
+                if(nextLevel_list.empty()){
+                    if(nextIndex <= endIndex){
+                        nextLevel_list.clear();
+                        (cache[level + 1][nextIndex])->readAllIndexAndDataWithTimeStamp(nextLevel_list);
+                        ++nextIndex;
+                    } else {
+                        break;
+                    }
+                }
+            } else break;
             auto level_front = level_list.front();
             auto nextLevel_front = nextLevel_list.front();
             if(level_front.first.first == nextLevel_front.first.first){
                 if(level_front.second > nextLevel_front.second){
                     result.push_back(level_front.first);
+                    ++cnt;
                 } else {
                     result.push_back(nextLevel_front.first);
+                    ++cnt;
                 }
                 level_list.pop_front();
                 nextLevel_list.pop_front();
@@ -628,9 +666,11 @@ void KVStore::compaction(uint64_t level,  unsigned int moreNum)
             }
             if(level_front.first.first > nextLevel_front.first.first){
                 result.push_back(nextLevel_front.first);
+                ++cnt;
                 nextLevel_list.pop_front();
             } else {
                 result.push_back(level_front.first);
+                ++cnt;
                 level_list.pop_front();
             }
         }
@@ -638,12 +678,18 @@ void KVStore::compaction(uint64_t level,  unsigned int moreNum)
             while(!nextLevel_list.empty()){
                 auto nextLevel_front = nextLevel_list.front();
                 result.push_back(nextLevel_front.first);
+                ++cnt;
                 nextLevel_list.pop_front();
+                if(cnt > KV_NUM_TO_WRITE_IN_COMPACTION){
+                    tryWriteSomeListToSSTables(result, maxTimeStamp, level+1, nextLevelTempCache);
+                    cnt = 0;
+                }
             }
         } else {
             while(!level_list.empty()){
                 auto level_front = level_list.front();
                 result.push_back(level_front.first);
+                ++cnt;
                 level_list.pop_front();
             }
         }
@@ -680,10 +726,16 @@ void KVStore::compaction(uint64_t level,  unsigned int moreNum)
             }
         }
 
+        // 将中途为避免占用内存过大事先读走的 nextLevelTempCache 先放入 level+1 cache 中
+        for(auto j = 0; j < nextLevelTempCache.size(); ++j){
+            cache[level + 1].push_back(nextLevelTempCache[j]);
+        }
+        nextLevelTempCache.clear();
+
         // 将结果每 2 MB 分成一个新的 SSTable 文件（最后一个 SSTable 可以不足 2MB），写入到 Level 1 中
         // 在其中操作时 cache 直接 push_back 即可
         // 取最大 maxTimeStamp 作为共同 timeStamp
-        writeListToSSTables(result, maxTimeStamp, level + 1);
+        writeAllListToSSTables(result, maxTimeStamp, level + 1);
 
         // 将临时缓存与目前的缓存合并
         if(findTableInNextLevel)
@@ -717,8 +769,9 @@ void KVStore::checkCompaction()
 
 // 函数将所有 allList 中的 key-value 对写入 SSTables （每达到 2MB 分新文件），并记录对应缓存
 // 第一个参数为 allList，第二个参数为临时的指向缓存的指针（new 出来的）
-void KVStore::writeListToSSTables(std::list<std::pair<uint64_t, std::string> > &allList, const uint64_t &timeStamp, const uint64_t &level)
+void KVStore::writeAllListToSSTables(std::list<std::pair<uint64_t, std::string> > &allList, const uint64_t &timeStamp, const uint64_t &level)
 {
+    bool isMaxLvl = (level == this->maxLevel);
     uint64_t size = INIT_BYTES_SIZE;
     std::string level_str = "/level-" + std::to_string(level);
     std::list<std::pair<uint64_t, std::string>> currentList;
@@ -729,7 +782,12 @@ void KVStore::writeListToSSTables(std::list<std::pair<uint64_t, std::string> > &
         std::string tmpVal = tmp.second;
         size += (tmpVal.length() + KEY_BYTES_SIZE + OFFSET_BYTES_SIZE);
         if(size <= MAX_BYTES_SIZE){
-            currentList.push_back(tmp);
+            if(isMaxLvl)
+                if(tmpVal == "~DELETED~"){
+                    size -= (tmpVal.length() + KEY_BYTES_SIZE + OFFSET_BYTES_SIZE);
+                    continue;
+                }
+            currentList.push_back(std::move(tmp));
             ++numKey;
         } else {
             // 到 2MB，转化成 SSTable
@@ -789,4 +847,49 @@ void KVStore::clearAllCacheAndFiles() {
     std::vector<SSTables*> level0;
     cache.push_back(level0);
     this->maxLevel = 0;
+}
+
+// 为了缓解内存占用过大的问题，在 result 具备一定规模时尝试写一部分，nextLevelTempCache 暂存这一部分的 cache
+void KVStore::tryWriteSomeListToSSTables(std::list<std::pair<uint64_t, std::string>> &allList, const uint64_t &timeStamp, const uint64_t &level, std::vector<SSTables *> &nextLevelTempCache) {
+
+    bool isMaxLvl = (level == this->maxLevel);
+    uint64_t size = INIT_BYTES_SIZE;
+    std::string level_str = "/level-" + std::to_string(level);
+    std::list<std::pair<uint64_t, std::string> > currentList;
+    uint64_t numKey = 0;
+    while (!allList.empty()){
+        auto tmp = allList.front();
+        allList.pop_front();
+        std::string tmpVal = tmp.second;
+        size += (tmpVal.length() + KEY_BYTES_SIZE + OFFSET_BYTES_SIZE);
+        if(size <= MAX_BYTES_SIZE){
+            if(isMaxLvl)
+                if(tmpVal == "~DELETED~"){
+                    size -= (tmpVal.length() + KEY_BYTES_SIZE + OFFSET_BYTES_SIZE);
+                    continue;
+                }
+            currentList.push_back(std::move(tmp));
+            ++numKey;
+        } else {
+            // 到 2MB，转化成 SSTable
+            // 获取有关信息
+            uint64_t minKey = currentList.front().first;
+            uint64_t maxKey = currentList.back().first;
+            if(maxKey < minKey)
+                throw("ERROR   maxKey < minKey in writeListToSSTables");
+            std::string currentFileName = generateFileName(timeStamp, minKey, maxKey, numKey);
+            // 新建 SSTables 并存入对应缓存
+            SSTables* ssTable = new SSTables(dir + level_str, currentList, minKey, maxKey, numKey, timeStamp, currentFileName);
+            nextLevelTempCache.push_back(ssTable);
+            // 将刚刚未能转换的插入 currentList
+            currentList.clear();
+            numKey = 0;
+            size = INIT_BYTES_SIZE;
+            size += (tmpVal.length() + KEY_BYTES_SIZE + OFFSET_BYTES_SIZE);
+            currentList.push_back(tmp);
+            ++numKey;
+        }
+    }
+    // 剩下的没有来得及写的再放回去
+    allList = std::move(currentList);
 }
