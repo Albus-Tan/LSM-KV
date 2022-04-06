@@ -6,32 +6,21 @@ KVStore::KVStore(const std::string &_dir): KVStoreAPI(_dir)
     dir = _dir;
     memTable = new MemTables(dir);
 
-    // now only pushback level 0
-    std::vector<SSTables*> level0;
-    cache.push_back(level0);
-
-    /*// reload cache
-    cache.clear();
-    std::vector<std::string> fileNames;
-    std::string fileName;
-    uint64_t maxLevel = 0;
-    uint64_t level = 0;
-    while(level <= maxLevel){
-        std::string level_str = "/level-" + std::to_string(level);
-        int fileNum = utils::scanDir(dir + level_str, fileNames);
-        while(fileNum > 0){
-            fileName = fileNames.back();
-            fileNames.pop_back();
-            SSTables ssTable(dir + level_str, fileName);
-            cache[level].push_back(ssTable);
-            --fileNum;
-        }
-        ++level;
-    }*/
+    // 在启动时，需检查现有的数据目录中各层 SSTable 文件，并在内存中构建相应的缓存
+    // 如果有找到文件并重建成功返回 true，如果现有数据目录为空返回 false
+    if(!rebuildCacheFromDir()){
+        // 如若没有找到任何文件， only pushback level 0
+        std::vector<SSTables*> level0;
+        cache.push_back(level0);
+    }
 }
 
 KVStore::~KVStore()
 {
+    // 系统在正常关闭时（可以实现在析构函数里面），应将 MemTable 中的所有数据以 SSTable 形式写回（类似于 MemTable 满了时的操作）
+    if(memTable->getSize() > INIT_BYTES_SIZE) convertMemToSS();
+    memTable->reset();
+
     for(auto it = cache.begin(); it != cache.end(); ++it){
         for (auto _it = (*it).begin(); _it != (*it).end(); ++_it) {
             delete *_it;
@@ -54,23 +43,9 @@ void KVStore::put(uint64_t key, const std::string &s)
     if(memTable->getSize() <= MAX_BYTES_SIZE){
         memTable->put(key, s);
     } else {
-        // convert to SSTable
-        std::list<std::pair<uint64_t, std::string> > all;
-        uint64_t numKey = 0;
-        uint64_t minKey = 0;
-        uint64_t maxKey = 0;
-        memTable->getAll(all, minKey, maxKey, numKey);
-        assert(numKey != 0);
-        uint64_t level = 0;
-        std::string level_str = "/level-" + std::to_string(level);
-        // 确定文件名并赋值到此处，不包含.sst
-        // 文件命名格式 timeStamp minKey-maxKey pairsNum
-        std::string currentFileName = generateFileName(nextTimeStamp, minKey, maxKey, numKey);
-        SSTables* ssTable = new SSTables(dir + level_str, all, minKey, maxKey, numKey, nextTimeStamp, currentFileName);
-        ++nextTimeStamp;
 
-        cache[0].push_back(ssTable);
-        checkCompaction();
+        // 将 MemTable 中的所有数据以 SSTable 形式写回
+        convertMemToSS();
 
         memTable->reset();
         memTable->setSize(memTable->getSize() + s.length() + KEY_BYTES_SIZE + OFFSET_BYTES_SIZE);
@@ -118,7 +93,6 @@ std::string KVStore::get(uint64_t key)
  */
 bool KVStore::del(uint64_t key)
 {
-    //TODO: 添加delete之后出现bug 最后生成的一个文件（可能包含全是delete）为0kb 考虑是不是memtable中delete键值都不需要特殊处理？
     if(memTable->del(key)) return true;
     std::string res = get(key);
     if(res == "" || res == "~DELETED~") return false;
@@ -892,4 +866,81 @@ void KVStore::tryWriteSomeListToSSTables(std::list<std::pair<uint64_t, std::stri
     }
     // 剩下的没有来得及写的再放回去
     allList = std::move(currentList);
+}
+
+// 在启动时，需检查现有的数据目录中各层 SSTable 文件，并在内存中构建相应的缓存
+// 如果有找到文件并重建成功返回 true，如果现有数据目录为空返回 false
+bool KVStore::rebuildCacheFromDir() {
+    // reload cache
+    cache.clear();
+
+    std::vector<std::string> levelDirNames;
+    int levelDirNum = utils::scanDir(dir, levelDirNames);
+    if(levelDirNum == 0) return false;
+
+    uint64_t maxLevel = levelDirNum - 1;
+    uint64_t level = 0;
+    uint64_t maxTimeStamp = 1;
+    while(levelDirNum > 0){
+        auto levelDirName = levelDirNames[level];
+        std::string level_str = "level-" + std::to_string(level);
+        if(levelDirName != level_str) throw("ERROR  in rebuildCacheFromDir: levelDir problem when rebuilding " + level_str);
+
+        // std::cout << "rebuilding " << levelDirName << std::endl;
+        std::vector<SSTables*> levelCache;
+        cache.push_back(levelCache);
+
+        std::vector<std::string> fileNames;
+        std::string fileName;
+        int fileNum = utils::scanDir(dir + "/" + level_str, fileNames);
+        if(level != 0 && level != maxLevel && fileNum != (2 << level)) throw("ERROR  in rebuildCacheFromDir: files num incorrect in " + level_str);
+        int index = 0;
+        while(index < fileNum){
+            fileName = fileNames[index];
+            auto idx = fileName.find(".sst");//在a中查找b.
+            if(idx == std::string::npos) throw("ERROR  in rebuildCacheFromDir: file name not including .sst");
+            std::string pureFileName = fileName.substr(0, idx);
+            SSTables* ssTable = new SSTables(dir + "/" + level_str, pureFileName);
+            // 比较获取最大的时间戳
+            maxTimeStamp = getMax(maxTimeStamp, ssTable->getTimeStamp());
+            cache[level].push_back(ssTable);
+            ++index;
+        }
+
+
+        // level 0 按照时间戳在 cache 中排列，时间戳小的放在前面
+        // 其余 level 中按照最小键的顺序在 cache 中排列
+        if(level != 0){
+            std::sort(cache[level].begin(), cache[level].end(), cmpSSTableMinKey);
+        } else {
+            std::sort(cache[level].begin(), cache[level].end(), cmpSSTableTimeStamp);
+        }
+
+        --levelDirNum;
+        ++level;
+    }
+
+    this->maxLevel = maxLevel;
+    this->nextTimeStamp = maxTimeStamp + 1;
+
+}
+
+void KVStore::convertMemToSS() {
+    // convert to SSTable
+    std::list<std::pair<uint64_t, std::string> > all;
+    uint64_t numKey = 0;
+    uint64_t minKey = 0;
+    uint64_t maxKey = 0;
+    memTable->getAll(all, minKey, maxKey, numKey);
+    assert(numKey != 0);
+    uint64_t level = 0;
+    std::string level_str = "/level-" + std::to_string(level);
+    // 确定文件名并赋值到此处，不包含.sst
+    // 文件命名格式 timeStamp minKey-maxKey pairsNum
+    std::string currentFileName = generateFileName(nextTimeStamp, minKey, maxKey, numKey);
+    SSTables* ssTable = new SSTables(dir + level_str, all, minKey, maxKey, numKey, nextTimeStamp, currentFileName);
+    ++nextTimeStamp;
+
+    cache[0].push_back(ssTable);
+    checkCompaction();
 }

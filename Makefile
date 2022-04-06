@@ -8,7 +8,7 @@ correctness: BloomFilters.h SSTables.o SkipLists.o MemTables.o kvstore.o correct
 
 persistence: BloomFilters.h SSTables.o SkipLists.o MemTables.o kvstore.o persistence.o
 
-try: BloomFilters.h SSTables.o SkipLists.o MemTables.o kvstore.o try.cpp
+try:  utils.h try.cpp
 
 clean:
 	-rm -f correctness persistence *.o

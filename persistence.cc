@@ -184,6 +184,8 @@ int main(int argc, char *argv[])
         test.start_test(static_cast<void *>(&testmode));
     } catch(const char * e){
         std::cout << e << std::endl;
+    } catch (std::exception &exception){
+        std::cout << exception.what() << std::endl;
     } catch(...){
         std::cout << "unknown error !" << std::endl;
     }

@@ -29,8 +29,8 @@ public:
     SSTables(const std::string dir, const std::string fileName);
     SSTables(const std::string dir, std::list<std::pair<uint64_t, std::string> > &list, uint64_t &minKey, uint64_t &maxKey, uint64_t &numKey, const uint64_t &timeStamp, const std::string fileName);
     ~SSTables(){ if(bloomFilter) delete bloomFilter; index.clear(); };
-    void writeSSTable(const std::string dir, std::list<std::pair<uint64_t, std::string> > &list);
-    void readSSTable(const std::string dir, const std::string fileName);
+    void writeSSTable(std::list<std::pair<uint64_t, std::string> > &list);
+    void readSSTable();
 
     std::string get(uint64_t key, const std::string &filePath);
     void readAllIndexAndData(std::list<std::pair<uint64_t, std::string> > &all);
@@ -58,7 +58,7 @@ private:
 
     void readHeader(std::ifstream &istrm);
     void readBloomFilter(std::ifstream &istrm);
-    void readIndexAndData(std::ifstream &istrm);
+    void readAllIndex(std::ifstream &istrm);
 
     std::string getData(const uint32_t &posDataStart, uint32_t posDataEnd, const std::string &filePath);
 

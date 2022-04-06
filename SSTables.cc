@@ -24,21 +24,17 @@ SSTables::SSTables(const std::string dir, std::list<std::pair<uint64_t, std::str
     }
 
     // Index is written in writeIndexAndData
-    writeSSTable(dir, allList);
+    writeSSTable( allList);
 }
 
 SSTables::SSTables(const std::string dir, const std::string fileName)
 {
     this->dir = dir;
     this->fileName = fileName;
-
-    //TODO: may have bugs here, fileName including .sst??
-    //  also readSSTable's read index and data is really old version
-
-    readSSTable(dir, fileName);
+    readSSTable();
 }
 
-void SSTables::writeSSTable(const std::string dir, std::list<std::pair<uint64_t, std::string> > &allList)
+void SSTables::writeSSTable(std::list<std::pair<uint64_t, std::string> > &allList)
 {
     if(!utils::dirExists(dir)) {
         utils::mkdir(dir.c_str());
@@ -58,20 +54,20 @@ void SSTables::writeSSTable(const std::string dir, std::list<std::pair<uint64_t,
     ostrm.close();
 }
 
-void SSTables::readSSTable(const std::string dir, const std::string fileName)
+void SSTables::readSSTable()
 {
     if(!utils::dirExists(dir)) {
-        utils::mkdir(dir.c_str());
+        throw("ERROR  SSTables::readSSTable dir NOT Exists");
     }
-    std::string filepath = dir + "/" + fileName;
+    std::string filepath = dir + "/" + fileName + ".sst";
     std::ifstream istrm(filepath, std::ios::binary);
 
     // Header
     readHeader(istrm);
     // BloomFilter
     readBloomFilter(istrm);
-    // Index and Data
-    readIndexAndData(istrm);
+    // Index
+    readAllIndex(istrm);
 
     istrm.close();
 }
@@ -185,7 +181,7 @@ void SSTables::readBloomFilter(std::ifstream &istrm)
     uint64_t size = bloomFilter->getSize();
 
     uint64_t times = size / BITS_IN_BYTE;
-   int restBitNum = size % BITS_IN_BYTE;
+    int restBitNum = size % BITS_IN_BYTE;
     uint64_t index = 0;
     bool val[BITS_IN_BYTE] = {false};
     char packedVal = 0;
@@ -208,38 +204,33 @@ void SSTables::readBloomFilter(std::ifstream &istrm)
         }
     }
 }
-void SSTables::readIndexAndData(std::ifstream &istrm)
-{
-    // TODO
+void SSTables::readAllIndex(std::ifstream &istrm) {
+
+    if(!index.empty()) throw("ERROR  SSTables::readAllIndex  original index vector not empty");
+    index.clear();
 
     // 索引区和数据区开头位置计算
     uint64_t posIndex = INIT_BYTES_SIZE;
-    uint32_t posDataStart = posIndex;  // 数据起始位置与文件开头 ios::beg 的距离
-    uint32_t posDataEnd = posIndex;  // 数据终止位置与文件开头 ios::beg 的距离
-    // std::pair<uint64_t, std::string> tmp;
-    uint64_t tmpKey;
-    // 读出索引区和数据区
+    // 读出索引区
     istrm.seekg(posIndex, std::ios::beg);
-    // 读出 Key
-    istrm.read(reinterpret_cast<char*>(&tmpKey), KEY_BYTES_SIZE);
-    // 读出 Offset
-    istrm.read(reinterpret_cast<char*>(&(posDataStart)), OFFSET_BYTES_SIZE);
-    istrm.seekg((posIndex + OFFSET_BYTES_SIZE + 2 * KEY_BYTES_SIZE), std::ios::beg);
-    istrm.read(reinterpret_cast<char*>(&(posDataEnd)), OFFSET_BYTES_SIZE);
+    uint32_t offset;
+    uint64_t tmpKey;
+    uint64_t readed = 0;
+    while (readed < header.pairsNum) {
 
-    istrm.seekg(posDataStart, std::ios::beg);
+        // 读出 Key
+        istrm.read(reinterpret_cast<char *>(&tmpKey), KEY_BYTES_SIZE);
+        // 读出 Offset
+        istrm.read(reinterpret_cast<char *>(&(offset)), OFFSET_BYTES_SIZE);
 
-    /*std::cout << posDataEnd << std::endl;
-    std::cout << posDataStart << std::endl;
-    std::cout << posDataEnd - posDataStart + 1;*/
-    // 读出 Value
-    char* tmpVal = new char [posDataEnd - posDataStart + 1];
-    istrm.read((char*)tmpVal, posDataEnd - posDataStart);
+        Index tmp;
+        tmp.key = tmpKey;
+        tmp.offset = offset;
+        index.push_back(tmp);
 
-    tmpVal[posDataEnd - posDataStart] = '\0';
-    std::string val = tmpVal;
-    delete [] tmpVal;
-    // std::cout << "READ   KEY: " << tmpKey << " posStart: " << posDataStart << " posEnd: " << posDataEnd << " val: " << val  << std::endl;
+        ++readed;
+    }
+
 }
 
 std::string SSTables::get(uint64_t key, const std::string &filePath)
@@ -308,11 +299,13 @@ void SSTables::readAllIndexAndData(std::list<std::pair<uint64_t, std::string> > 
     uint64_t posIndex = INIT_BYTES_SIZE;
     uint32_t posDataStart = posIndex;  // 数据起始位置与文件开头 ios::beg 的距离
     uint32_t posDataEnd = posIndex;  // 数据终止位置与文件开头 ios::beg 的距离
-    int readed = 0;
+    uint64_t readed = 0;
     uint64_t tmpKey;
 
     // 读出索引区和数据区
     while(readed < (this->header.pairsNum)){
+
+        // TODO 可以利用 index 而不必每次都从文件读出 key 和 offset
 
         istrm.seekg(posIndex, std::ios::beg);
         // 读出 Key
@@ -365,6 +358,9 @@ void SSTables::readAllIndexAndDataWithTimeStamp(std::list<std::pair<std::pair<ui
     while(readed < (this->header.pairsNum)){
 
         istrm.seekg(posIndex, std::ios::beg);
+
+        // TODO 可以利用 index 而不必每次都从文件读出 key 和 offset
+
         // 读出 Key
         istrm.read(reinterpret_cast<char*>(&tmpKey), KEY_BYTES_SIZE);
         // 读出 Offset
@@ -457,6 +453,9 @@ void SSTables::readIndexAndDataForScan(std::list<std::pair<uint64_t, std::string
     while(tmpKey < key2 && !readAll){
 
         istrm.seekg(posIndex, std::ios::beg);
+
+        // TODO 可以利用 index 而不必每次都从文件读出 key 和 offset
+
         // 读出 Key
         istrm.read(reinterpret_cast<char*>(&tmpKey), KEY_BYTES_SIZE);
         // 读到比上界大的

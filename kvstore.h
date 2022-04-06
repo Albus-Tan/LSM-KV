@@ -11,6 +11,7 @@
 
 // 用于解决 bad_alloc 问题，通过在过程中先写一部分到硬盘上，减少内存压力的方式
 // 该值定义了在 result 积累到多少时尝试进行一批 SSTable 的写
+// 300
 #define KV_NUM_TO_WRITE_IN_COMPACTION 500
 
 // 自定义 compaction 中要使用的堆的比较函数
@@ -58,6 +59,13 @@ inline bool cmpSSTableMinKey( SSTables* &a, SSTables* &b )
     return a->getMinKey() < b->getMinKey();
 }
 
+// 自定义每一层 cache vector<SSTables*> 的比较函数，按照 timeStamp 比较大小
+// 遍历这一层 vector<SSTables*>，并按照 timeStamp 从小到大重新在这一层中排列
+inline bool cmpSSTableTimeStamp( SSTables* &a, SSTables* &b )
+{
+    return a->getTimeStamp() < b->getTimeStamp();
+}
+
 class KVStore : public KVStoreAPI {
 	// You can add your implementation here
 private:
@@ -84,6 +92,8 @@ private:
     }
 
     void clearAllCacheAndFiles();
+    bool rebuildCacheFromDir();
+    void convertMemToSS();
 
 public:
 
